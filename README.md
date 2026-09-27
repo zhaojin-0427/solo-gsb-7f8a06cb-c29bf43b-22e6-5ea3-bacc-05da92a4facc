@@ -1,11 +1,12 @@
 # 焦点审计 API（Focus Audit API）
 
-用 **Node.js + Express + parse5** 实现的可访问性审计服务，提供四个接口：
+用 **Node.js + Express + parse5** 实现的可访问性审计服务，提供五个接口：
 
 - `POST /audit`：提交一段 HTML 片段，返回其中可聚焦控件的 Tab 顺序、从 1 起的元素序号以及可访问性风险
 - `POST /accessible-names`：计算片段中控件与带 `role` 元素的可访问名称（accessible name），并报告缺失/循环引用与无名称元素
 - `POST /implicit-submit`：判定片段中每个 `<input>` 聚焦后按 Enter 能否触发[隐式提交（implicit submission）](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#implicit-submission)，返回表单归属、默认按钮、结果与原因
 - `POST /table-headers`：审计片段中各 `<table>` 数据格（`<td>`）的显式表头关联，返回每个 td 关联到的表头、表格序号与问题
+- `POST /ownership-tree`：按 `aria-owns` 重挂元素树，返回各节点最终父子关系、根列表、最终先序遍历与认领冲突问题
 
 ## 审计规则
 
@@ -334,6 +335,103 @@ curl -X POST http://localhost:3000/table-headers \
 | `INVALID_HEADER_REFERENCE` | `headers` 属性的某个令牌在本表中找不到同 id 的 `<th>`（不存在 / 指向非 th / 指向其他表），`refId` 给出该令牌 |
 | `NO_HEADER` | 该 td 最终没有关联到任何表头 |
 
+### `POST /ownership-tree`
+
+请求体形式与其他接口相同：直接发送 HTML 片段（`Content-Type: text/html`），或 JSON `{ "html": "..." }`。
+
+按 **[`aria-owns`](https://www.w3.org/TR/wai-aria-1.2/#aria-owns) 的所有权语义**重挂元素树，输出最终所有权树。
+
+#### 初始化与编号
+
+- 以 **parse5 元素树**初始化；**忽略 `<template>` 内容**（解析器把 template 子树放进独立的 content 片段）；**不按样式筛选**（`display:none` 等照常参与）
+- `dom` 沿用全部元素的全局**先序（文档序）编号**，从 1 起；同一元素在结果中的位置始终保持原文档序
+
+#### 处理规则
+
+按**原文档序**处理每个带 `aria-owns` 的元素：
+
+1. 属性值按**空白分词**；**同一元素的重复令牌忽略**（只按首次出现处理）
+2. id 解析取文档中**首个同名元素**
+3. 每个令牌依次检查，任一失败即**拒绝**并记录问题（报告拥有者 `owner`、令牌 `token` 与原因 `reason`），**拒绝不改变树**：
+
+   | reason | 含义 |
+   | --- | --- |
+   | `missing-target` | 目标缺失：片段中没有该 id 的元素（含位于 template 内） |
+   | `self-reference` | 自指：目标就是拥有者自身 |
+   | `already-claimed` | 目标此前**已被成功认领**（仅成功认领才占用目标，失败不占用） |
+   | `cycle` | 重挂成环：目标在**此前修改后的树**中是拥有者的祖先，移动会形成环 |
+
+4. 接受时，把**目标及其当前子树**移到拥有者子列表的**末尾**；目标**原为直接子节点也同样移到末尾**（即兄弟重排）
+
+#### 返回
+
+- `nodes`：按**原文档序**给出每个节点的 `dom`、最终父编号 `parent`（根为 `null`）与有序子编号 `children`（附 `tag`、`id`、`location`）
+- `roots`：最终根节点编号，**根间按原文档序**
+- `preOrder`：最终树的**先序遍历**（依次遍历根及其有序子节点）
+- `issues`：冲突问题，**按处理顺序**（拥有者文档序，再按令牌顺序）排列
+
+#### 重排示例（原为直接子节点也移到末尾）
+
+```bash
+curl -X POST http://localhost:3000/ownership-tree \
+  -H 'Content-Type: text/html' \
+  --data-binary '<div id="toolbar" aria-owns="save">
+  <button id="save">保存</button>
+  <button id="cancel">取消</button>
+</div>'
+```
+
+`save` 本是 `toolbar` 的直接子节点，认领后移到子列表末尾，最终先序变为 `toolbar → cancel → save`：
+
+```json
+{
+  "count": { "elements": 3, "owners": 1, "tokens": 1, "claims": 1, "issues": 0 },
+  "roots": [1],
+  "nodes": [
+    { "dom": 1, "tag": "div", "id": "toolbar", "parent": null, "children": [3, 2] },
+    { "dom": 2, "tag": "button", "id": "save", "parent": 1, "children": [] },
+    { "dom": 3, "tag": "button", "id": "cancel", "parent": 1, "children": [] }
+  ],
+  "preOrder": [1, 3, 2],
+  "issues": []
+}
+```
+
+#### 冲突示例（目标已被成功认领）
+
+```bash
+curl -X POST http://localhost:3000/ownership-tree \
+  -H 'Content-Type: text/html' \
+  --data-binary '<div id="a" aria-owns="x"></div>
+<div id="b" aria-owns="x y"></div>
+<span id="x"></span>
+<span id="y"></span>'
+```
+
+按文档序先处理 `a`：成功认领 `x`；再处理 `b`：令牌 `x` 已被成功认领而拒绝，令牌 `y` 正常认领。拒绝不改树，最终先序为 `a → x → b → y`：
+
+```json
+{
+  "count": { "elements": 4, "owners": 2, "tokens": 3, "claims": 2, "issues": 1 },
+  "roots": [1, 2],
+  "nodes": [
+    { "dom": 1, "tag": "div", "id": "a", "parent": null, "children": [3] },
+    { "dom": 2, "tag": "div", "id": "b", "parent": null, "children": [4] },
+    { "dom": 3, "tag": "span", "id": "x", "parent": 1, "children": [] },
+    { "dom": 4, "tag": "span", "id": "y", "parent": 2, "children": [] }
+  ],
+  "preOrder": [1, 3, 2, 4],
+  "issues": [
+    {
+      "owner": 2,
+      "token": "x",
+      "reason": "already-claimed",
+      "detail": "第 2 号元素 <div>#b的 aria-owns 令牌 \"x\" 指向的第 3 号元素 <span>#x已被成功认领"
+    }
+  ]
+}
+```
+
 ### `GET /health`
 
 健康检查，返回 `{"status":"ok"}`。
@@ -344,7 +442,7 @@ curl -X POST http://localhost:3000/table-headers \
 npm test
 ```
 
-使用 Node.js 内置测试运行器，覆盖排序、排除、radio 分组、风险判定，可访问名称的优先级、递归展开、缺失/循环引用、label 关联，隐式提交的表单归属、默认按钮（含失效不改选）、阻止型输入计数、disabled fieldset 与 legend 例外，表头关联的独立网格/嵌套表、跨行跨列占位与覆盖、`headers` 显式关联与无效引用、`scope` 推断，以及 HTTP 端点接线等 75 个用例。
+使用 Node.js 内置测试运行器，覆盖排序、排除、radio 分组、风险判定，可访问名称的优先级、递归展开、缺失/循环引用、label 关联，隐式提交的表单归属、默认按钮（含失效不改选）、阻止型输入计数、disabled fieldset 与 legend 例外，表头关联的独立网格/嵌套表、跨行跨列占位与覆盖、`headers` 显式关联与无效引用、`scope` 推断，aria-owns 所有权树的重挂重排、缺失/自指/重复认领/成环冲突与失败不占目标，以及 HTTP 端点接线等 87 个用例。
 
 ## 项目结构
 
@@ -354,13 +452,15 @@ src/
   accessible-names.js  # 可访问名称计算（aria-labelledby 递归展开、label 关联等）
   implicit-submit.js   # Enter 隐式提交判定（表单归属、默认按钮、disabled fieldset 等）
   table-headers.js     # HTML 表格表头关联审计（独立网格、跨行跨列、headers/scope 关联等）
-  app.js               # Express 应用（/audit、/accessible-names、/implicit-submit、/table-headers、/health）
+  ownership-tree.js    # aria-owns 所有权树（文档序处理、冲突拒绝、子树重挂、先序遍历）
+  app.js               # Express 应用（/audit、/accessible-names、/implicit-submit、/table-headers、/ownership-tree、/health）
   server.js            # 启动入口
 test/
   audit.test.js
   accessible-names.test.js
   implicit-submit.test.js
   table-headers.test.js
+  ownership-tree.test.js
 Dockerfile
 docker-compose.yml
 ```

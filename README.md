@@ -1,11 +1,12 @@
 # 焦点审计 API（Focus Audit API）
 
-用 **Node.js + Express + parse5** 实现的可访问性审计服务，提供四个接口：
+用 **Node.js + Express + parse5** 实现的可访问性审计服务，提供五个接口：
 
 - `POST /audit`：提交一段 HTML 片段，返回其中可聚焦控件的 Tab 顺序、从 1 起的元素序号以及可访问性风险
 - `POST /accessible-names`：计算片段中控件与带 `role` 元素的可访问名称（accessible name），并报告缺失/循环引用与无名称元素
 - `POST /implicit-submit`：判定片段中每个 `<input>` 聚焦后按 Enter 能否触发[隐式提交（implicit submission）](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#implicit-submission)，返回表单归属、默认按钮、结果与原因
 - `POST /table-headers`：审计片段中各 `<table>` 数据格（`<td>`）的显式表头关联，返回每个 td 关联到的表头、表格序号与问题
+- `POST /ownership-tree`：按 `aria-owns` 重挂元素树，返回各节点最终父编号、有序子编号、最终先序遍历与认领问题
 
 ## 审计规则
 
@@ -334,6 +335,71 @@ curl -X POST http://localhost:3000/table-headers \
 | `INVALID_HEADER_REFERENCE` | `headers` 属性的某个令牌在本表中找不到同 id 的 `<th>`（不存在 / 指向非 th / 指向其他表），`refId` 给出该令牌 |
 | `NO_HEADER` | 该 td 最终没有关联到任何表头 |
 
+### `POST /ownership-tree`
+
+请求体形式与其他接口相同：直接发送 HTML 片段（`Content-Type: text/html`），或 JSON `{ "html": "..." }`。
+
+按 `aria-owns` 把片段重挂成一棵所有权树，返回每个节点的最终父编号与有序子编号、最终先序遍历，以及认领过程中被逐条拒绝的问题。
+
+#### 初始化
+
+- 以 parse5 元素树为准：**忽略 template 内容**（parse5 将其放在 `template.content`，不进入子树），**不按样式筛选**（`display:none`、`hidden`、`inert` 等照常参与）
+- 全部元素按文档序（先序）从 1 起编号 `dom`，沿用全局元素序号；`id` 重复时取文档序**首个**同名元素
+
+#### 认领规则
+
+按**原文档序**处理带 `aria-owns` 的元素；属性值按空白分词，**同一元素的重复令牌忽略**。对每个令牌依次检查，失败即拒绝并报告拥有者、令牌和原因，**拒绝不改变树**：
+
+1. `missing-target`：目标 id 不存在
+2. `self-reference`：目标就是拥有者自身
+3. `already-claimed`：目标已被此前的拥有者**成功**认领（仅成功认领才占用目标，被拒绝的认领不占用）
+4. `cycle`：重挂会成环——在**此前修改后的树**中，目标是拥有者的祖先
+
+接受时把**目标及其当前子树**移到拥有者子节点**末尾**；目标原为拥有者直接子节点时也移到末尾（重排）。
+
+#### 返回
+
+- `nodes`：按原文档序给出各节点的 `dom`、`tag`、`id`（如有）、最终父编号 `parent`（根为 `null`，根间按原文档序）与有序子编号 `children`
+- `preorder`：最终树的先序遍历（根间按原文档序）
+- `issues`：按处理顺序排列（先按拥有者文档序，再按令牌顺序），每条含 `reason`、`owner`、`token`、`detail`
+
+#### 冲突与重排示例
+
+```bash
+curl -X POST http://localhost:3000/ownership-tree \
+  -H 'Content-Type: text/html' \
+  --data-binary '<nav id="nav" aria-owns="actions ghost"></nav>
+<div id="actions" aria-owns="nav"><button id="save">保存</button></div>
+<span id="tail"></span>'
+```
+
+返回示例（节选，节点条目另带 `location` 定位信息）：
+
+```json
+{
+  "count": { "elements": 4, "owners": 2, "claimed": 1, "issues": 2 },
+  "nodes": [
+    { "dom": 1, "tag": "nav", "id": "nav", "parent": null, "children": [2] },
+    { "dom": 2, "tag": "div", "id": "actions", "parent": 1, "children": [3] },
+    { "dom": 3, "tag": "button", "id": "save", "parent": 2, "children": [] },
+    { "dom": 4, "tag": "span", "id": "tail", "parent": null, "children": [] }
+  ],
+  "preorder": [1, 2, 3, 4],
+  "issues": [
+    {
+      "reason": "missing-target", "owner": 1, "token": "ghost",
+      "detail": "第 1 号元素 <nav>#nav的 aria-owns 引用了不存在的 id \"ghost\""
+    },
+    {
+      "reason": "cycle", "owner": 2, "token": "nav",
+      "detail": "第 2 号元素 <div>#actions的 aria-owns 引用了其祖先 id \"nav\"，重挂会形成循环"
+    }
+  ]
+}
+```
+
+例中 `#actions` 被 `#nav` 成功认领（连同 `#save` 子树移到 `#nav` 末尾，发生重排）；`ghost` 缺失被拒；`#actions` 再反向引用其祖先 `#nav` 会成环，同样被拒，树保持认领后的状态。
+
 ### `GET /health`
 
 健康检查，返回 `{"status":"ok"}`。
@@ -344,7 +410,7 @@ curl -X POST http://localhost:3000/table-headers \
 npm test
 ```
 
-使用 Node.js 内置测试运行器，覆盖排序、排除、radio 分组、风险判定，可访问名称的优先级、递归展开、缺失/循环引用、label 关联，隐式提交的表单归属、默认按钮（含失效不改选）、阻止型输入计数、disabled fieldset 与 legend 例外，表头关联的独立网格/嵌套表、跨行跨列占位与覆盖、`headers` 显式关联与无效引用、`scope` 推断，以及 HTTP 端点接线等 75 个用例。
+使用 Node.js 内置测试运行器，覆盖排序、排除、radio 分组、风险判定，可访问名称的优先级、递归展开、缺失/循环引用、label 关联，隐式提交的表单归属、默认按钮（含失效不改选）、阻止型输入计数、disabled fieldset 与 legend 例外，表头关联的独立网格/嵌套表、跨行跨列占位与覆盖、`headers` 显式关联与无效引用、`scope` 推断，aria-owns 所有权树的认领/重排/冲突/判环（基于修改后的树）、template 忽略，以及 HTTP 端点接线等 94 个用例。
 
 ## 项目结构
 
@@ -354,13 +420,15 @@ src/
   accessible-names.js  # 可访问名称计算（aria-labelledby 递归展开、label 关联等）
   implicit-submit.js   # Enter 隐式提交判定（表单归属、默认按钮、disabled fieldset 等）
   table-headers.js     # HTML 表格表头关联审计（独立网格、跨行跨列、headers/scope 关联等）
-  app.js               # Express 应用（/audit、/accessible-names、/implicit-submit、/table-headers、/health）
+  ownership-tree.js    # aria-owns 所有权树（认领、重排、冲突与判环）
+  app.js               # Express 应用（/audit、/accessible-names、/implicit-submit、/table-headers、/ownership-tree、/health）
   server.js            # 启动入口
 test/
   audit.test.js
   accessible-names.test.js
   implicit-submit.test.js
   table-headers.test.js
+  ownership-tree.test.js
 Dockerfile
 docker-compose.yml
 ```

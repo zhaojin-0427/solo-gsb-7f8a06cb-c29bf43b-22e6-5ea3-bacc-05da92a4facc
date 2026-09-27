@@ -5,6 +5,7 @@ const { auditHtml } = require('./audit');
 const { accessibleNames } = require('./accessible-names');
 const { implicitSubmit } = require('./implicit-submit');
 const { tableHeaders } = require('./table-headers');
+const { ownershipTree } = require('./ownership-tree');
 
 const app = express();
 
@@ -87,6 +88,21 @@ app.post('/table-headers', (req, res) => {
     return res.status(500).json({
       error: 'TABLE_HEADERS_FAILED',
       message: err && err.message ? err.message : '表头关联审计失败',
+    });
+  }
+});
+
+app.post('/ownership-tree', (req, res) => {
+  const html = extractHtml(req);
+  if (html === null) return badRequest(res);
+
+  try {
+    const result = ownershipTree(html);
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({
+      error: 'OWNERSHIP_TREE_FAILED',
+      message: err && err.message ? err.message : '所有权树计算失败',
     });
   }
 });
